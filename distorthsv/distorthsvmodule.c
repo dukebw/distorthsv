@@ -44,11 +44,11 @@ rgb_to_hsv(float r, float g, float b, float* h, float* s, float* v)
         float norm = 1.0f / (6.0f * range);
         float hh;
         if (r == vv) {
-                hh = norm * (g - b);
+                hh = norm*(g - b);
         } else if (g == vv) {
-                hh = norm * (b - r) + 2.0 / 6.0;
+                hh = norm*(b - r) + 2.0/6.0;
         } else {
-                hh = norm * (r - g) + 4.0 / 6.0;
+                hh = norm*(r - g) + 4.0/6.0;
         }
         if (range <= 0.0) {
                 hh = 0;
@@ -130,9 +130,20 @@ get_inout_vid_array(PyObject *video_obj)
                                                   NPY_ARRAY_ENSUREARRAY));
 }
 
+static void
+fill_err_msg(char *err_msg,
+             uint32_t err_msg_size,
+             const char *fmt,
+             const char *func_name)
+{
+        int32_t num_bytes = snprintf(err_msg, err_msg_size, fmt, func_name);
+        assert((num_bytes >= 0) &&
+               ((uint32_t)num_bytes < err_msg_size));
+}
+
 /**
  * Checks `vid_array` for:
- * 1. Being 4D.
+ * 1. Being 4D (or 3D image).
  * 2. Being contiguous.
  * 3. Being aligned.
  *
@@ -142,15 +153,14 @@ static int32_t
 check_vid_array(PyArrayObject *vid_array, const char *func_name)
 {
         char err_msg[128];
-        int32_t num_bytes = snprintf(err_msg,
-                                     sizeof(err_msg),
-                                     "%s: invalid dimensions, array not "
-                                     "contiguous or not aligned.",
-                                     func_name);
-        assert((num_bytes >= 0) &&
-               ((uint32_t)num_bytes < sizeof(err_msg)));
+        fill_err_msg(err_msg,
+                     sizeof(err_msg),
+                     "%s: invalid dimensions, array not "
+                     "contiguous or not aligned.",
+                     func_name);
 
-        if ((PyArray_NDIM(vid_array) != 4) ||
+        if (((PyArray_NDIM(vid_array) != 4) &&
+             (PyArray_NDIM(vid_array) != 3)) ||
             !PyArray_IS_C_CONTIGUOUS(vid_array) ||
             !PyArray_ISALIGNED(vid_array)) {
                 PyErr_SetString(PyExc_ValueError, err_msg);
@@ -209,12 +219,16 @@ distorthsv(PyObject *self, PyObject *args, PyObject *kw)
 
         omp_set_num_threads(max_num_threads);
 
-        float *video = PyArray_DATA(vid_array);
         npy_intp *dims = PyArray_DIMS(vid_array);
+        uint32_t num_array_elem = dims[0]*dims[1]*dims[2];
+        if (PyArray_NDIM(vid_array) == 4)
+                num_array_elem *= dims[3];
+
+        float *video = PyArray_DATA(vid_array);
 #pragma omp parallel for default(none) \
-        shared(dims, video, hue_factor, saturation_factor, brightness_factor)
+        shared(dims, video, hue_factor, saturation_factor, brightness_factor, num_array_elem)
         for (uint32_t i = 0;
-             i < dims[0]*dims[1]*dims[2]*dims[3];
+             i < num_array_elem;
              i += 3) {
                 float h;
                 float s;
@@ -294,11 +308,19 @@ distort_contrast(PyObject *self, PyObject *args, PyObject *kw)
         float r_mean = 0.f;
         float g_mean = 0.f;
         float b_mean = 0.f;
-        uint32_t num_pixels = dims[0]*dims[1]*dims[2];
-#pragma omp parallel for default(none) shared(dims, video, num_pixels) \
+
+        uint32_t num_pixels = dims[0]*dims[1];
+        uint32_t num_array_elem = num_pixels*dims[2];
+        if (PyArray_NDIM(vid_array) == 4) {
+                num_pixels *= dims[2];
+                num_array_elem *= dims[3];
+        }
+
+#pragma omp parallel for default(none) \
+        shared(dims, video, num_pixels, num_array_elem) \
         reduction(+:r_mean, g_mean, b_mean)
         for (uint32_t i = 0;
-             i < num_pixels*dims[3];
+             i < num_array_elem;
              i += 3) {
                 r_mean += video[i + 0];
                 g_mean += video[i + 1];
@@ -315,9 +337,9 @@ distort_contrast(PyObject *self, PyObject *args, PyObject *kw)
         b_mean *= mean_scale;
 
 #pragma omp parallel for default(none) \
-        shared(dims, video, contrast_factor, r_mean, g_mean, b_mean)
+        shared(dims, video, contrast_factor, r_mean, g_mean, b_mean, num_array_elem)
         for (uint32_t i = 0;
-             i < dims[0]*dims[1]*dims[2]*dims[3];
+             i < num_array_elem;
              i += 3) {
                 video[i + 0] = clampf01(contrast_factor*video[i + 0] +
                                         r_mean);
@@ -364,6 +386,18 @@ fliplr(PyObject *self, PyObject *args, PyObject *kw)
 
         if (check_vid_array(vid_array, "fliplr") < 0)
                 goto clean_up;
+
+        /* NOTE(brendan): Only 4D tensors here. For images, PIL is fine. */
+        char err_msg[128];
+        fill_err_msg(err_msg,
+                     sizeof(err_msg),
+                     "%s: invalid dimensions (not 4)",
+                     "fliplr");
+
+        if (PyArray_NDIM(vid_array) != 4) {
+                PyErr_SetString(PyExc_ValueError, err_msg);
+                goto clean_up;
+        }
 
         omp_set_num_threads(max_num_threads);
 
